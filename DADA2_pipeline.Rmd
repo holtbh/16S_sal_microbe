@@ -1,0 +1,252 @@
+---
+title: "DADA2_pipeline"
+author: "BHH"
+date: "February 13, 2020"
+output: html_document
+---
+
+set working directory to where primer removed fastq sequences are prior to beginning
+```{r}
+library(dada2)
+library(ShortRead)
+library(Biostrings)
+packageVersion("dada2")
+
+
+list.files()
+```
+Make sure all the files of interest are there
+
+```{r}
+fnFs <- sort(list.files(pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(pattern="_R2_001.fastq", full.names = TRUE)) ## This organizes things
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+quartz()
+plotQualityProfile(fnFs[1:10]) ## median is the green line, range in orange line
+plotQualityProfile(fnFs[1:10]) #forward quality looks pretty good throughout the whole read (stays above 30 until the end, but lets trim at 250 anyways)
+
+plotQualityProfile(fnRs[1:10]) # quality drops pretty quick after around 250
+```
+
+if you desire to save all the plots produced by this for total visualization, run this
+```{r}
+qualityprofilesfnFs<-plotQualityProfile(fnFs) 
+qualityprofilesfnRs<-plotQualityProfile(fnRs)
+quartz()
+plot(qualityprofilesfnFs)
+plot(qualityprofilesfnRs)
+```
+
+
+setting up a new folder for filtered reads
+```{r}
+filtFs <- file.path("filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+
+filtRs <- file.path("filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+names(filtFs) <- sample.names
+names(filtRs)<-sample.names 
+```
+
+Filtering, setting trim to 250,250. Trimming length is based on quality profiles generated above. It's important to maintain overlap when merging and also preserve as much reads as possible while maintaining quality. Decreasing maxEE removed more reads, as the threshold for error detection is more strict. Setting it to three increased read output. Essentially what this does it calculates the expected errors along a sequence and removes reads containing errors higher than specified values. This seems better than taking an average Q-score.
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,250),
+                     maxN=0, maxEE=c(3,3), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE)
+```
+
+looking at the output to see how many reads were removed
+```{r}
+out2<-as.data.frame(out)
+out2$lost<-out2$reads.in-out2$reads.out
+out2 ## how many reads were removed
+head(out) 
+```
+
+this will take a few hours to run depending on sample size.
+Black line is estimatd error rates after convergence of machine learning algorithm. Red is the expected rates under nominal Q-score definition. they look somewhat reasonable? like theres weird humps but idk, overall trends agree with the standard
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE) ## modelling base erros
+quartz()
+plotErrors(errF, nominalQ = T)
+
+errR<-learnErrors(filtRs, multithread = T)
+quartz()
+plotErrors(errR, nominalQ = T)
+```
+
+now to filter out errors
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE) 
+dadaRs<-dada(filtRs, err=errR, multithread = TRUE)
+```
+first glance and how many sequence variants
+```{r}
+dadaFs[[1]]
+dadaRs[[1]]
+```
+
+Now to merge the paired ends and inspect the first few. Typically, some reads dont align. If you are losing quite a few reads, make sure overlap is sufficient during trimming step
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+head(mergers[[1]]) 
+```
+
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+table(nchar(getSequences(seqtab)))
+```
+
+Removing chimeras and seeing how many chimeras are in the dataset
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+Tracking reads through the pipeline
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+track2<-as.data.frame(track)
+track2$lost<-track2$input-track2$nonchim
+track2
+write.csv(track2, "subs2_reads.csv")
+```
+
+Assigning taxon. There are a few ways to do this, I found the alternative method (below) failed to classify many ASVs. Make sure both assigning files are present in the directory you are working in.
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+
+taxa <- addSpecies(taxa, "silva_species_assignment_v132.fa.gz")
+head(taxa)
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+Alternative method for assigning taxa and creatinga  DNA string set.
+```{r}
+library(DECIPHER)
+packageVersion("DECIPHER")
+
+load("SILVA_SSU_r132_March2018.RData")
+
+dna <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+
+ids <- IdTaxa(dna, trainingSet, strand="top", processors=NULL, verbose=FALSE) # use all processors
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+```
+
+Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+```{r}
+taxid <- t(sapply(ids, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab.nochim)
+```
+
+There is an option to verify with a mock community of 12 members (see dada2 pipeline tutorial).
+
+Cleaning up data, organizing and attaching metadata on sample info
+```{r}
+BiocManager::install(phyloseq)
+
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+theme_set(theme_bw()) ## setting theme so all plots look the same
+
+# Now lets build a dataframa and start
+samples.out <- rownames(seqtab.nochim)
+samples.out
+meta<-read.csv(file.choose())
+meta<-as.data.frame(meta)
+samples.out
+
+names(meta) ## make sure to have a column specifying control or sample
+sample_names(meta)
+row.names(meta)<-samples.out ## remember to do this, if not it wont work
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(meta), 
+               tax_table(taxa)) ##phyloseq object
+
+saveRDS(ps, file= "ps_seq.rds")
+```
+
+converning so row names are ASV. dna sequences are still stored by doing refseq(ps)
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(ps)) 
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+ex.table<-otu_table(ps) ## this is a table for visualization and some data analysis, but the ps object will be more handy
+save(ex.table, file = "ex.table.Rdata")
+```
+
+*now to remove sequences associated with contamination. Make sure metadata has information pertaining to whether samples are 'sample' or 'control'*
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(decontam)
+ps<-readRDS("ps_seq.rds")
+ps
+head(sample_data(ps))
+```
+
+inspecting library sizes/number of reads per sample. 
+```{r}
+df<-as.data.frame(sample_data(ps))
+df$librarysize<-sample_sums(ps)
+df<-df[order(df$librarysize),]
+df$index<-seq(nrow(df))
+ggplot(data=df, aes(x=index, y=librarysize, color=Sample_or_Control)) + geom_point()
+```
+
+Identifying contaminants based on prevalence. isContaminant requires TRUE to be assigned for control. The threshold can be manipulated according to reads removed. 
+```{r}
+sample_data(ps)$is.neg<- sample_data(ps)$Sample_orControl =="Control"
+
+contamdf.prev<-isContaminant(ps, method = 'prevalence', neg = "is.neg", threshold = 0.5)
+
+table(contamdf.prev$contaminant)
+
+head(which(contamdf.prev$contaminant))
+```
+
+
+Making a phyloseq object of presence/absence in controls and true samples
+```{r}
+ps.pa<-transform_sample_counts(ps, function(abund) 1*(abund>0))
+ps.pa.neg<- prune_samples(sample_data(ps.pa)$Sample_or_Control=="Control", ps.pa)
+ps.pa.pos<-prune_samples(sample_data(ps.pa)$Sample_or_Control=="Sample", ps.pa)
+# making dataframe of prevalence in control and neg samples
+
+df.pa<-data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg), contaminant=contamdf.prev$contaminant)
+
+ggplot(data = df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() + xlab("Prevalence (Controls)") + ylab("Prevalence (Samples)")
+```
+
+Now to remove contaminant ASVs
+```{r}
+ps.noncontam<-prune_taxa(!contamdf.prev$contaminaant, ps)
+ps.noncontam
+saveRDS(ps.noncontam, file = "nc_ps.rds")
+```
+
+
+
